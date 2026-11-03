@@ -1,0 +1,15 @@
+[Unit]
+Description=EcoFlow voltage Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=/opt/voltage-bot
+ExecStart=/opt/voltage-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
