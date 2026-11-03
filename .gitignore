@@ -1,0 +1,10 @@
+# Secrets: EcoFlow login, API keys, Telegram token
+.env
+
+# Runtime data
+voltage_log.csv
+live_messages.json
+
+__pycache__/
+*.pyc
+.DS_Store
