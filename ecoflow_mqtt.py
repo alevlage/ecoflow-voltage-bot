@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import ssl
 import struct
@@ -29,6 +30,8 @@ import httpx
 import paho.mqtt.client as mqtt
 
 from ecoflow_api import EcoFlowError, load_dotenv
+
+log = logging.getLogger(__name__)
 
 API = "https://api.ecoflow.com"
 
@@ -159,13 +162,20 @@ class EcoFlowMqtt:
 
     def listen(self, sn: str) -> None:
         connected = threading.Event()
-        self.client.on_connect = lambda c, u, f, rc, p: connected.set()
+
+        def on_connect(client, userdata, flags, rc, props):
+            # Subscribe on every connect: paho reconnects by itself after a
+            # network drop, but the broker forgets subscriptions.
+            client.subscribe(f"/app/device/property/{sn}")
+            client.subscribe(f"/app/{self.user_id}/{sn}/thing/property/get_reply")
+            connected.set()
+
+        self.client.on_connect = on_connect
         self.client.connect(self.host, self.port, keepalive=30)
         self.client.loop_start()
         if not connected.wait(15):
+            self.stop()
             raise EcoFlowError("Could not connect to EcoFlow MQTT broker")
-        self.client.subscribe(f"/app/device/property/{sn}")
-        self.client.subscribe(f"/app/{self.user_id}/{sn}/thing/property/get_reply")
         # Ask the device for a full snapshot (works for JSON devices like River 2).
         self.request_snapshot(sn)
 
@@ -245,6 +255,9 @@ class LiveReader:
     # A live grid voltage changes every few seconds; a frozen one means the
     # device is showing a leftover value from a dead socket.
     FROZEN_AFTER = 30.0
+    # With no data for this long, log in again and reconnect: the connection
+    # or its login may have expired. Also the retry interval while it fails.
+    RECONNECT_AFTER = 120.0
 
     def __init__(self, sn: str, interval: float = 1.0):
         load_dotenv()
@@ -256,8 +269,21 @@ class LiveReader:
         self.volts_changed_at: float = 0.0
         self.started_at: float = 0.0
         self._stop = threading.Event()
-        self.ef = EcoFlowMqtt(os.environ["ECOFLOW_EMAIL"], os.environ["ECOFLOW_PASSWORD"])
-        self.ef.on_payload = self._on_payload
+        self._connected_at: float = 0.0
+        self.ef: EcoFlowMqtt | None = None
+
+    def _connect(self) -> None:
+        if self.ef:
+            try:
+                self.ef.stop()
+            except Exception:
+                pass
+            self.ef = None
+        self._connected_at = time.time()
+        ef = EcoFlowMqtt(os.environ["ECOFLOW_EMAIL"], os.environ["ECOFLOW_PASSWORD"])
+        ef.on_payload = self._on_payload
+        ef.listen(self.sn)
+        self.ef = ef
 
     def _on_payload(self, topic, payload) -> None:
         reading = find_ac_input(parse_payload(payload))
@@ -283,16 +309,35 @@ class LiveReader:
 
     def _poll(self) -> None:
         while not self._stop.wait(self.interval):
-            self.ef.request_snapshot(self.sn)
+            now = time.time()
+            silent_for = now - max(self.updated_at, self._connected_at)
+            if self.ef is None or silent_for > self.RECONNECT_AFTER:
+                log.warning("No data from EcoFlow for %.0f s, reconnecting", silent_for)
+                try:
+                    self._connect()
+                    log.info("Reconnected to EcoFlow")
+                except Exception as e:
+                    log.warning("Reconnect failed (%s), retrying in %.0f s", e, self.RECONNECT_AFTER)
+                continue
+            try:
+                self.ef.request_snapshot(self.sn)
+            except Exception:
+                pass  # paho reconnects by itself; the watchdog above covers the rest
 
     def start(self) -> None:
+        """Connect and keep polling. Never raises: if the first connect fails,
+        the poll thread keeps retrying."""
         self.started_at = time.time()
-        self.ef.listen(self.sn)
+        try:
+            self._connect()
+        except Exception as e:
+            log.warning("Could not connect to EcoFlow (%s), will retry", e)
         threading.Thread(target=self._poll, daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()
-        self.ef.stop()
+        if self.ef:
+            self.ef.stop()
 
 
 def main() -> None:
