@@ -155,6 +155,16 @@ function draw() {
   const hm = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
   ctx.font = "11px system-ui";
+  // Round-number grid: every 5/10/20 V, about one line per 40 px.
+  const guides = [LOW, NOMINAL, HIGH];
+  const step = [5, 10, 20, 50].find(s => (h - padB) / ((hi - lo) / s) >= 36) || 50;
+  ctx.strokeStyle = cssVar("--hint"); ctx.fillStyle = cssVar("--hint"); ctx.lineWidth = 1;
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
+    ctx.globalAlpha = 0.12;
+    ctx.beginPath(); ctx.moveTo(padL, y(v)); ctx.lineTo(w, y(v)); ctx.stroke();
+    ctx.globalAlpha = 0.8;
+    if (guides.every(g => Math.abs(y(g) - y(v)) > 12)) ctx.fillText(`${v}`, 2, y(v) + 4);
+  }
   // Horizontal guides: alert limits in light red, nominal voltage in grey.
   for (const [v, color] of [[LOW, cssVar("--low")], [NOMINAL, cssVar("--hint")], [HIGH, cssVar("--low")]]) {
     ctx.strokeStyle = color; ctx.fillStyle = color;

@@ -21,6 +21,7 @@ voltage_log.csv; charts use the last 3 hours kept in memory.
 Sends a warning to TELEGRAM_ALLOWED_IDS when the voltage stays out of range
 (VOLTAGE_LOW / VOLTAGE_HIGH in .env, default 180 / 250 V) for
 VOLTAGE_ALERT_AFTER seconds (default 10), and again when it's back to normal.
+Also says when the electricity comes back after an outage of a minute or more.
 
 Reads data via the app-login route (ecoflow_mqtt.py), so it needs
 ECOFLOW_EMAIL, ECOFLOW_PASSWORD and ECOFLOW_SN in .env, plus:
@@ -67,6 +68,7 @@ TEXT_EVERY = float(os.environ.get("LIVE_UPDATE_EVERY", 10))  # seconds between c
 CHART_EVERY = 120.0  # seconds between chat chart refreshes
 LIVE_MINUTES = float(os.environ.get("LIVE_MINUTES", 15))  # length of a chat live session
 STALE_AFTER = 15    # seconds without device data before saying so
+POWER_BACK_AFTER = 60.0  # seconds; shorter outages get no "electricity is back" message
 MAX_BACKOFF = 300.0  # slowest edit interval after repeated rate limits
 COMMAND_MAX_WAIT = 30.0  # a command gives up rather than wait longer for a rate limit
 
@@ -289,7 +291,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/plot adds a chart of the last hour; /plot 15 shows the last 15 minutes "
         f"(up to {history.KEEP_MINUTES}).\n"
         f"{page}"
-        f"You'll get a warning if the voltage stays below {alarm.low:.0f} V or above {alarm.high:.0f} V.\n"
+        f"You'll get a warning if the voltage stays below {alarm.low:.0f} V or above {alarm.high:.0f} V, "
+        f"and a message when the electricity comes back.\n"
         f"Your chat ID: {update.effective_chat.id}",
         reply_markup=page_button(),
     )
@@ -345,6 +348,45 @@ async def record_history() -> None:
                 await asyncio.to_thread(history.append, reader.volts, on, reader.watts, last)
 
 
+async def notify_all(app: Application, text: str) -> None:
+    """Send `text` to every allowed chat, waiting out rate limits, then re-post live messages."""
+    log.info("Notify: %s", text.replace("\n", " | "))
+    for chat_id in allowed_ids:
+        try:
+            await with_retry(lambda: app.bot.send_message(chat_id, text, reply_markup=page_button()))
+            await keep_live_last(app.bot, chat_id)
+        except Exception:
+            log.exception("Could not send a message to %s", chat_id)
+
+
+def took(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{max(minutes, 1)} min"
+    return f"{minutes // 60} h {minutes % 60} min" if minutes % 60 else f"{minutes // 60} h"
+
+
+async def watch_power(app: Application) -> None:
+    """Message every allowed chat when the electricity comes back after an outage."""
+    off_since = history.current_outage_start()  # outage already going on at startup
+    while True:
+        await asyncio.sleep(UPDATE_EVERY)
+        now = time.time()
+        if not reader.updated_at or now - reader.updated_at > STALE_AFTER:
+            continue  # no fresh data from the device: can't tell
+        on = reader.electricity_on()
+        if on is False and off_since is None:
+            # The voltage froze when the power went, so that's when it started.
+            off_since = reader.volts_changed_at or now
+        elif on and off_since is not None:
+            off_for, started = now - off_since, off_since
+            off_since = None
+            if off_for >= POWER_BACK_AFTER:
+                await notify_all(app, f"💡 Electricity is back: {reader.volts:.1f} V\n"
+                                      f"⚫ It was off for {took(off_for)}, "
+                                      f"since {datetime.fromtimestamp(started):%H:%M}")
+
+
 async def watch_voltage(app: Application) -> None:
     """Message every allowed chat when the voltage goes out of range or back."""
     last = 0.0
@@ -358,14 +400,7 @@ async def watch_voltage(app: Application) -> None:
         level = alarm.update(reader.volts, last)
         if level is None:
             continue
-        text = alarm.message(level, reader.volts)
-        log.info("Alert: %s", text)
-        for chat_id in allowed_ids:
-            try:
-                await with_retry(lambda: app.bot.send_message(chat_id, text, reply_markup=page_button()))
-                await keep_live_last(app.bot, chat_id)
-            except Exception:
-                log.exception("Could not send alert to %s", chat_id)
+        await notify_all(app, alarm.message(level, reader.volts))
 
 
 async def on_startup(app: Application) -> None:
@@ -389,6 +424,7 @@ async def on_startup(app: Application) -> None:
     asyncio.create_task(record_history())
     if allowed_ids:
         asyncio.create_task(watch_voltage(app))
+        asyncio.create_task(watch_power(app))
     else:
         log.warning("TELEGRAM_ALLOWED_IDS is empty, so voltage alerts are off")
     log.info("Alerts below %.0f V or above %.0f V", alarm.low, alarm.high)

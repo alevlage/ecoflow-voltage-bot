@@ -95,6 +95,20 @@ def outages(rows: list[tuple[float, float | None]]) -> list[tuple[float, float |
     return spans
 
 
+def current_outage_start() -> float | None:
+    """Start of the outage going on in the latest readings, or None if there's electricity."""
+    with _lock:
+        # Old readings (the bot was down) don't say what happened since.
+        if not _recent or _recent[-1][1] is not None or time.time() - _recent[-1][0] > 300:
+            return None
+        start = _recent[-1][0]
+        for ts, volts in reversed(_recent):
+            if volts is not None:
+                break
+            start = ts
+        return start
+
+
 def plot_png(minutes: int, limits: tuple[float, float] | None = None, fmt: str = "png") -> bytes | None:
     """Render the last `minutes` (up to 180) of history. Returns image bytes, or None if empty.
 
