@@ -95,8 +95,10 @@ def outages(rows: list[tuple[float, float | None]]) -> list[tuple[float, float |
     return spans
 
 
-def plot_png(minutes: int, limits: tuple[float, float] | None = None) -> bytes | None:
-    """Render the last `minutes` (up to 180) of history. Returns PNG bytes, or None if empty.
+def plot_png(minutes: int, limits: tuple[float, float] | None = None, fmt: str = "png") -> bytes | None:
+    """Render the last `minutes` (up to 180) of history. Returns image bytes, or None if empty.
+
+    `fmt` is "png", or "jpeg" for Telegram inline results, which only take JPEG.
 
     `limits` are the (low, high) alert limits, drawn as light red lines.
     """
@@ -152,6 +154,6 @@ def plot_png(minutes: int, limits: tuple[float, float] | None = None) -> bytes |
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png")
+    fig.savefig(buf, format=fmt, **({"pil_kwargs": {"quality": 90}} if fmt == "jpeg" else {}))
     plt.close(fig)
     return buf.getvalue()

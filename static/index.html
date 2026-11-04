@@ -24,7 +24,9 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    margin: 0; padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); background: var(--bg); color: var(--text);
+    /* Fill the screen: the chart card takes whatever height is left. */
+    display: flex; flex-direction: column; min-height: var(--tg-viewport-stable-height, 100vh);
     font: 16px/1.4 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
   }
   .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 12px; }
@@ -39,7 +41,14 @@
     background: var(--bg); color: var(--text); cursor: pointer;
   }
   .ranges button.active { background: var(--accent); color: var(--accent-text); }
-  canvas { width: 100%; height: 240px; display: block; }
+  .chart-card { flex: 1; display: flex; flex-direction: column; }
+  .plot { flex: 1; position: relative; min-height: 240px; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .share {
+    width: 100%; border: 0; border-radius: 12px; padding: 14px 0; font: inherit; font-weight: 600;
+    background: var(--accent); color: var(--accent-text); cursor: pointer;
+  }
+  .share:disabled { opacity: 0.6; cursor: default; }
   .stats { display: flex; justify-content: space-between; font-size: 13px; color: var(--hint); margin-top: 8px; }
   .error { color: var(--low); }
 </style>
@@ -50,15 +59,16 @@
     <div class="volts" id="volts">—</div>
     <div class="updated" id="updated"></div>
   </div>
-  <div class="card">
+  <div class="card chart-card">
     <div class="ranges">
       <button data-min="15">15 min</button>
       <button data-min="60" class="active">1 hour</button>
       <button data-min="180">3 hours</button>
     </div>
-    <canvas id="chart"></canvas>
+    <div class="plot"><canvas id="chart"></canvas></div>
     <div class="stats"><span id="min"></span><span id="max"></span></div>
   </div>
+  <button class="share" id="share">📤 Share chart</button>
 
 <script>
 // Wrapped in a function: Telegram for macOS injects its own global `css`
@@ -204,7 +214,39 @@ function draw() {
   document.getElementById("max").textContent = vals.length ? `max ${Math.max(...vals).toFixed(1)} V` : "";
 }
 
+// Share: the server prepares a message (chart picture + summary) for the
+// chosen range, then Telegram shows its own chat picker.
+const shareBtn = document.getElementById("share");
+const shareLabel = () => {
+  shareBtn.textContent = `📤 Share last ${rangeMin < 60 ? rangeMin + " min" : rangeMin / 60 + (rangeMin === 60 ? " hour" : " hours")}`;
+};
+shareLabel();
+document.querySelectorAll(".ranges button").forEach(b => b.addEventListener("click", shareLabel));
+const notify = msg => (tg && tg.showAlert ? tg.showAlert(msg) : alert(msg));
+shareBtn.onclick = async () => {
+  if (!tg || !tg.shareMessage || !tg.isVersionAtLeast("8.0")) {
+    notify("Sharing needs a newer Telegram app. Please update Telegram.");
+    return;
+  }
+  shareBtn.disabled = true; shareBtn.textContent = "Preparing…";
+  try {
+    const r = await fetch("api/share", {
+      method: "POST",
+      headers: { "X-Telegram-Init-Data": initData, "Content-Type": "application/json" },
+      body: JSON.stringify({ minutes: rangeMin }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    tg.shareMessage(d.id);
+  } catch (e) {
+    notify("Couldn't share: " + e.message);
+  } finally {
+    shareBtn.disabled = false; shareLabel();
+  }
+};
+
 window.addEventListener("resize", draw);
+if (tg) tg.onEvent("viewportChanged", draw);
 poll();
 setInterval(poll, 1000);
 })();

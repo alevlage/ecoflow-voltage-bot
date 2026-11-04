@@ -392,8 +392,8 @@ async def on_startup(app: Application) -> None:
     else:
         log.warning("TELEGRAM_ALLOWED_IDS is empty, so voltage alerts are off")
     log.info("Alerts below %.0f V or above %.0f V", alarm.low, alarm.high)
-    app.bot_data["web"] = await webapp.start(reader, bot_token, allowed_ids,
-                                             (alarm.low, alarm.high), WEBAPP_PORT)
+    app.bot_data["web"] = await webapp.start(reader, app.bot, allowed_ids,
+                                             (alarm.low, alarm.high), WEBAPP_PORT, WEBAPP_URL)
     for chat_id, state in load_live().items():
         # Resume only sessions that haven't ended; old saves have no "until".
         if (not allowed_ids or chat_id in allowed_ids) and state.get("until", 0) > time.time():
