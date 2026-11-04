@@ -72,6 +72,12 @@ def load_recent() -> None:
                 _recent.append((float(ts), float(volts) if volts else None))
 
 
+def recent(since: float) -> list[tuple[float, float | None]]:
+    """Readings newer than `since`, oldest first, as (timestamp, volts or None)."""
+    with _lock:
+        return [row for row in _recent if row[0] > since]
+
+
 def plot_png(minutes: int) -> bytes | None:
     """Render the last `minutes` (up to 180) of history. Returns PNG bytes, or None if empty."""
     minutes = min(minutes, KEEP_MINUTES)

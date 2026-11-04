@@ -1,10 +1,18 @@
-"""Telegram bot that shows the EcoFlow AC input voltage, live.
+"""Telegram bot that shows the EcoFlow AC input voltage.
 
 Commands:
-    /voltage  - send a message and keep updating it every few seconds
+    /voltage  - a message that updates for 15 minutes, then pauses
+    /plot [minutes] - add a chart above it (default: last 60 minutes, max 180)
+    /live     - button that opens the live page (updates every second)
     /stop     - stop updating
-    /plot [minutes] - add a live chart, refreshed every 30 s (default: last 60 minutes, max 180)
     /start    - help
+
+Why live updates in the chat are limited: Telegram blocks bots that edit
+messages nonstop. Editing every 3 s for ~4.5 hours got this bot blocked for
+16 hours, alerts included. So chat updates run in 15-minute sessions
+(LIVE_MINUTES), text at most every 10 s, chart every 2 minutes. The live
+page (webapp.py, at WEBAPP_URL) is the always-on, every-second view: it
+talks to this server directly, not through Telegram.
 
 The live chart and text stay at the bottom of the chat: when the bot posts
 an alert, it re-posts them below it. Every reading is logged to
@@ -18,6 +26,7 @@ Reads data via the app-login route (ecoflow_mqtt.py), so it needs
 ECOFLOW_EMAIL, ECOFLOW_PASSWORD and ECOFLOW_SN in .env, plus:
     TELEGRAM_BOT_TOKEN   - from @BotFather
     TELEGRAM_ALLOWED_IDS - comma-separated chat IDs allowed to use the bot (optional but recommended)
+    WEBAPP_URL           - public https URL of the live page (optional; no button without it)
 """
 
 from __future__ import annotations
@@ -30,11 +39,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from telegram import BotCommand, InputMediaPhoto, Update
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+                      Update, WebAppInfo)
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import history
+import webapp
 from alerts import VoltageAlarm
 from ecoflow_api import load_dotenv
 from ecoflow_mqtt import LiveReader
@@ -46,15 +57,17 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 load_dotenv()
 sn = os.environ["ECOFLOW_SN"]
+bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
 allowed_ids = {int(x) for x in os.environ.get("TELEGRAM_ALLOWED_IDS", "").split(",") if x.strip()}
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()
+WEBAPP_PORT = int(os.environ.get("WEBAPP_PORT", 8080))
 
 UPDATE_EVERY = 1.0  # seconds between device snapshot requests
-# Seconds between live text edits. Telegram rate-limits sustained edits: at one
-# per second it froze the bot for ~9 minutes after about 40 minutes.
-TEXT_EVERY = float(os.environ.get("LIVE_UPDATE_EVERY", 3))
+TEXT_EVERY = float(os.environ.get("LIVE_UPDATE_EVERY", 10))  # seconds between chat text edits
+CHART_EVERY = 120.0  # seconds between chat chart refreshes
+LIVE_MINUTES = float(os.environ.get("LIVE_MINUTES", 15))  # length of a chat live session
 STALE_AFTER = 15    # seconds without device data before saying so
-CHART_EVERY = 30.0  # seconds between live chart refreshes
-MAX_BACKOFF = 60.0  # slowest edit interval after repeated rate limits
+MAX_BACKOFF = 300.0  # slowest edit interval after repeated rate limits
 COMMAND_MAX_WAIT = 30.0  # a command gives up rather than wait longer for a rate limit
 
 # Alerts go to every chat in TELEGRAM_ALLOWED_IDS.
@@ -68,7 +81,7 @@ reader = LiveReader(sn, interval=UPDATE_EVERY)
 
 # Each chat can have a live chart and, below it, a live text message, both kept
 # at the bottom of the chat. Saved so updates resume after a restart:
-# {chat id: {"text": message id, "chart": message id or None, "minutes": int}}
+# {chat id: {"text": id, "chart": id or None, "minutes": int, "until": timestamp}}
 LIVE_PATH = Path(__file__).with_name("live_messages.json")
 live: dict[int, dict] = {}
 live_tasks: dict[int, list[asyncio.Task]] = {}
@@ -83,12 +96,18 @@ def load_live() -> dict[int, dict]:
         saved = json.loads(LIVE_PATH.read_text())
     except (FileNotFoundError, ValueError):
         return {}
-    # Older versions saved just the text message id.
+    # Older versions saved just the text message id, and had no "until".
     return {int(c): v if isinstance(v, dict) else {"text": v} for c, v in saved.items()}
 
 
 def is_allowed(update: Update) -> bool:
     return not allowed_ids or update.effective_chat.id in allowed_ids
+
+
+def page_button() -> InlineKeyboardMarkup | None:
+    if not WEBAPP_URL:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📈 Live page", web_app=WebAppInfo(WEBAPP_URL))]])
 
 
 def status_text() -> str:
@@ -105,20 +124,27 @@ def status_text() -> str:
     return f"⚫ No electricity\n🕒 {stamp}"
 
 
-async def keep_editing(chat_id: int, message_id: int, every: float, edit) -> None:
-    """Call `edit()` every `every` seconds until the message is gone.
+def paused_text() -> str:
+    hint = "Tap 📈 Live page for every-second updates, or" if WEBAPP_URL else "Send"
+    return f"{status_text()}\n⏸ Updates paused. {hint} /voltage to resume."
+
+
+async def keep_editing(chat_id: int, every: float, until: float, edit, finish=None) -> None:
+    """Call `edit()` every `every` seconds until `until`, then `finish()` once.
 
     When Telegram rate-limits us, wait as told and halve the edit rate; speed
     back up gradually once edits go through again.
     """
     interval = every
     ok_streak = 0
-    while True:
-        await asyncio.sleep(interval)
+    while time.time() < until:
+        await asyncio.sleep(min(interval, max(0.0, until - time.time())))
+        if time.time() >= until:
+            break
         try:
             await edit()
             ok_streak += 1
-            if interval > every and ok_streak >= 50:
+            if interval > every and ok_streak >= 20:
                 interval = max(every, interval / 2)
                 ok_streak = 0
         except RetryAfter as e:
@@ -134,6 +160,11 @@ async def keep_editing(chat_id: int, message_id: int, every: float, edit) -> Non
             return
         except Exception as e:
             log.warning("Live update failed in %s (%s), retrying", chat_id, e)  # e.g. network blip
+    if finish:
+        try:
+            await finish()
+        except Exception as e:
+            log.warning("Could not mark live updates as paused in %s: %s", chat_id, e)
 
 
 async def with_retry(send, attempts: int = 3, max_wait: float | None = None):
@@ -155,22 +186,34 @@ async def with_retry(send, attempts: int = 3, max_wait: float | None = None):
 
 def resume_live(bot, chat_id: int, state: dict) -> None:
     live[chat_id] = state
+    until = state.get("until", 0)
     tasks = []
     if state.get("chart"):
         async def edit_chart(message_id=state["chart"], minutes=state.get("minutes", 60)):
             png = await asyncio.to_thread(history.plot_png, minutes)
             if png:
                 await bot.edit_message_media(InputMediaPhoto(png), chat_id=chat_id, message_id=message_id)
-        tasks.append(asyncio.create_task(keep_editing(chat_id, state["chart"], CHART_EVERY, edit_chart)))
+        tasks.append(asyncio.create_task(
+            keep_editing(chat_id, CHART_EVERY, until, edit_chart, finish=edit_chart)))
     if state.get("text"):
         last_text = [None]
 
         async def edit_text(message_id=state["text"]):
             text = status_text()
             if text != last_text[0]:
-                await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
+                await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id,
+                                            reply_markup=page_button())
                 last_text[0] = text
-        tasks.append(asyncio.create_task(keep_editing(chat_id, state["text"], TEXT_EVERY, edit_text)))
+
+        async def finish_text(message_id=state["text"]):
+            await bot.edit_message_text(paused_text(), chat_id=chat_id, message_id=message_id,
+                                        reply_markup=page_button())
+            if live.get(chat_id) is state:  # session over: nothing to re-post after alerts
+                live.pop(chat_id)
+                live_tasks.pop(chat_id, None)
+                save_live()
+        tasks.append(asyncio.create_task(
+            keep_editing(chat_id, TEXT_EVERY, until, edit_text, finish=finish_text)))
     live_tasks[chat_id] = tasks
 
 
@@ -194,11 +237,12 @@ post_locks: dict[int, asyncio.Lock] = {}  # commands run concurrently; one re-po
 
 
 async def post_live(bot, chat_id: int, chart_minutes: int | None = None,
-                    max_wait: float | None = None) -> None:
+                    max_wait: float | None = None, until: float | None = None) -> None:
     """(Re)post the live chart and text at the bottom of the chat.
 
     chart_minutes: show a chart of that many minutes; None keeps whatever
     chart the chat already had (or none).
+    until: when the session ends; None starts a new LIVE_MINUTES session.
 
     The new messages are sent first and the old ones deleted only after
     that worked, so a failure (e.g. a rate limit) leaves the old ones live.
@@ -207,15 +251,17 @@ async def post_live(bot, chat_id: int, chart_minutes: int | None = None,
         old = live.get(chat_id) or {}
         if chart_minutes is None and old.get("chart"):
             chart_minutes = old.get("minutes", 60)
-        state = {"text": None, "chart": None, "minutes": chart_minutes}
+        state = {"text": None, "chart": None, "minutes": chart_minutes,
+                 "until": until or time.time() + LIVE_MINUTES * 60}
         if chart_minutes:
             png = await asyncio.to_thread(history.plot_png, chart_minutes)
             if png:
                 state["chart"] = (await with_retry(lambda: bot.send_photo(chat_id, png),
                                                    max_wait=max_wait)).message_id
         try:
-            state["text"] = (await with_retry(lambda: bot.send_message(chat_id, status_text()),
-                                              max_wait=max_wait)).message_id
+            state["text"] = (await with_retry(
+                lambda: bot.send_message(chat_id, status_text(), reply_markup=page_button()),
+                max_wait=max_wait)).message_id
         except Exception:
             if state["chart"]:  # don't leave a half-posted pair behind
                 try:
@@ -229,18 +275,23 @@ async def post_live(bot, chat_id: int, chart_minutes: int | None = None,
 
 
 async def keep_live_last(bot, chat_id: int) -> None:
-    """After the bot posts something else, move the live messages back to the bottom."""
-    if chat_id in live:
-        await post_live(bot, chat_id)
+    """After the bot posts something else, move a running session back to the bottom."""
+    state = live.get(chat_id)
+    if state and state.get("until", 0) > time.time():
+        await post_live(bot, chat_id, until=state["until"])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    page = "/live opens a page that updates every second.\n" if WEBAPP_URL else ""
     await update.message.reply_text(
-        f"Send /voltage to see the AC input voltage, updated every {TEXT_EVERY:.0f} s. /stop stops it.\n"
-        f"/plot adds a live chart of the last hour, refreshed every {CHART_EVERY:.0f} s; "
-        f"/plot 15 shows the last 15 minutes (up to {history.KEEP_MINUTES}).\n"
+        f"/voltage shows the AC input voltage, updated every {TEXT_EVERY:.0f} s "
+        f"for {LIVE_MINUTES:.0f} min. /stop stops it.\n"
+        f"/plot adds a chart of the last hour; /plot 15 shows the last 15 minutes "
+        f"(up to {history.KEEP_MINUTES}).\n"
+        f"{page}"
         f"You'll get a warning if the voltage stays below {alarm.low:.0f} V or above {alarm.high:.0f} V.\n"
-        f"Your chat ID: {update.effective_chat.id}"
+        f"Your chat ID: {update.effective_chat.id}",
+        reply_markup=page_button(),
     )
 
 
@@ -248,6 +299,15 @@ async def voltage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     await post_live(context.bot, update.effective_chat.id, max_wait=COMMAND_MAX_WAIT)
+
+
+async def live_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if not WEBAPP_URL:
+        await update.message.reply_text("The live page isn't set up (WEBAPP_URL is empty).")
+        return
+    await update.message.reply_text("Tap to open the live page:", reply_markup=page_button())
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -302,7 +362,7 @@ async def watch_voltage(app: Application) -> None:
         log.info("Alert: %s", text)
         for chat_id in allowed_ids:
             try:
-                await with_retry(lambda: app.bot.send_message(chat_id, text))
+                await with_retry(lambda: app.bot.send_message(chat_id, text, reply_markup=page_button()))
                 await keep_live_last(app.bot, chat_id)
             except Exception:
                 log.exception("Could not send alert to %s", chat_id)
@@ -310,12 +370,18 @@ async def watch_voltage(app: Application) -> None:
 
 async def on_startup(app: Application) -> None:
     # Shown in Telegram's Menu button and when typing "/".
-    await app.bot.set_my_commands([
-        BotCommand("voltage", "Live voltage, updated every few seconds"),
-        BotCommand("plot", "Live chart, last 60 min (e.g. /plot 15)"),
-        BotCommand("stop", "Stop live updates"),
+    commands = [
+        BotCommand("voltage", f"Voltage, updated for {LIVE_MINUTES:.0f} min"),
+        BotCommand("plot", "Chart, last 60 min (e.g. /plot 15)"),
+        BotCommand("stop", "Stop updates"),
         BotCommand("start", "Help and your chat ID"),
-    ])
+    ]
+    if WEBAPP_URL:
+        commands.insert(0, BotCommand("live", "Live page, updated every second"))
+    try:
+        await app.bot.set_my_commands(commands)
+    except Exception as e:  # e.g. still rate-limited; must not stop the bot from starting
+        log.warning("Could not set the command menu: %s", e)
     await asyncio.to_thread(history.load_recent)
     await asyncio.to_thread(reader.start)
     log.info("Connected to EcoFlow, watching %s", sn)
@@ -326,9 +392,13 @@ async def on_startup(app: Application) -> None:
     else:
         log.warning("TELEGRAM_ALLOWED_IDS is empty, so voltage alerts are off")
     log.info("Alerts below %.0f V or above %.0f V", alarm.low, alarm.high)
+    app.bot_data["web"] = await webapp.start(reader, bot_token, allowed_ids,
+                                             (alarm.low, alarm.high), WEBAPP_PORT)
     for chat_id, state in load_live().items():
-        if not allowed_ids or chat_id in allowed_ids:
+        # Resume only sessions that haven't ended; old saves have no "until".
+        if (not allowed_ids or chat_id in allowed_ids) and state.get("until", 0) > time.time():
             resume_live(app.bot, chat_id, state)
+    save_live()
     if live:
         log.info("Resumed live updates in %d chat(s)", len(live))
 
@@ -344,19 +414,22 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_shutdown(app: Application) -> None:
     reader.stop()
+    if "web" in app.bot_data:
+        await app.bot_data["web"].cleanup()
 
 
 def main() -> None:
     app = (
         Application.builder()
         .concurrent_updates(True)  # a slow command must not block the others
-        .token(os.environ["TELEGRAM_BOT_TOKEN"])
+        .token(bot_token)
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("voltage", voltage))
+    app.add_handler(CommandHandler("live", live_page))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("plot", plot))
     app.add_error_handler(on_error)

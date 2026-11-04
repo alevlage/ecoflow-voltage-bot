@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live Voltage</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #888888);
+    --accent: var(--tg-theme-button-color, #2a7de1);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --card: var(--tg-theme-secondary-bg-color, #f2f3f5);
+    --low: #d9534f;
+    --high: #e0912b;
+    --ok: #2e9e5b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-tg]) {
+      --bg: #17181a; --text: #f1f1f1; --hint: #9a9a9a; --card: #222427;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 12px; }
+  .status { font-size: 15px; color: var(--hint); }
+  .volts { font-size: 56px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .volts small { font-size: 24px; font-weight: 500; color: var(--hint); }
+  .volts.low { color: var(--low); } .volts.high { color: var(--high); }
+  .updated { font-size: 13px; color: var(--hint); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .ranges { display: flex; gap: 8px; margin-bottom: 10px; }
+  .ranges button {
+    flex: 1; border: 0; border-radius: 10px; padding: 8px 0; font: inherit; font-size: 14px;
+    background: var(--bg); color: var(--text); cursor: pointer;
+  }
+  .ranges button.active { background: var(--accent); color: var(--accent-text); }
+  canvas { width: 100%; height: 240px; display: block; }
+  .stats { display: flex; justify-content: space-between; font-size: 13px; color: var(--hint); margin-top: 8px; }
+  .error { color: var(--low); }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="status" id="status">Connecting…</div>
+    <div class="volts" id="volts">—</div>
+    <div class="updated" id="updated"></div>
+  </div>
+  <div class="card">
+    <div class="ranges">
+      <button data-min="15">15 min</button>
+      <button data-min="60" class="active">1 hour</button>
+      <button data-min="180">3 hours</button>
+    </div>
+    <canvas id="chart"></canvas>
+    <div class="stats"><span id="min"></span><span id="max"></span></div>
+  </div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); document.documentElement.dataset.tg = "1"; }
+const initData = tg ? tg.initData : "";
+
+// Alert limits come from the server (VOLTAGE_LOW / VOLTAGE_HIGH).
+let LOW = 190, HIGH = 250;
+const NOMINAL = 230;
+
+let rows = [];          // [timestamp, volts or null], oldest first
+let lastTs = 0;
+let rangeMin = 60;
+
+document.querySelectorAll(".ranges button").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".ranges button").forEach(x => x.classList.remove("active"));
+  b.classList.add("active");
+  rangeMin = +b.dataset.min;
+  draw();
+});
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+async function poll() {
+  try {
+    const r = await fetch(`api/data?since=${lastTs}`, { headers: { "X-Telegram-Init-Data": initData } });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    LOW = d.low; HIGH = d.high;
+    for (const row of d.history) rows.push(row);
+    if (rows.length) lastTs = rows[rows.length - 1][0];
+    const cutoff = Date.now() / 1000 - d.keep_minutes * 60;
+    while (rows.length && rows[0][0] < cutoff) rows.shift();
+    show(d.now);
+    draw();
+  } catch (e) {
+    document.getElementById("status").innerHTML = `<span class="error">${e.message}</span>`;
+  }
+}
+
+function show(now) {
+  const status = document.getElementById("status");
+  const volts = document.getElementById("volts");
+  const stale = !now.ts || Date.now() / 1000 - now.ts > 15;
+  volts.className = "volts";
+  if (stale) {
+    status.textContent = "⚠️ No data from the device";
+    volts.innerHTML = "—";
+  } else if (now.on === null) {
+    status.textContent = "⏳ Checking whether there's electricity…";
+    volts.innerHTML = "—";
+  } else if (now.on) {
+    status.textContent = "🔌 Electricity is on";
+    volts.innerHTML = `${now.volts.toFixed(1)}<small> V</small>`;
+    if (now.volts < LOW) volts.classList.add("low");
+    if (now.volts > HIGH) volts.classList.add("high");
+  } else {
+    status.textContent = "⚫ No electricity";
+    volts.innerHTML = "—";
+  }
+  document.getElementById("updated").textContent =
+    now.ts ? "Updated " + new Date(now.ts * 1000).toLocaleTimeString() : "";
+}
+
+function draw() {
+  const canvas = document.getElementById("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const end = Date.now() / 1000, start = end - rangeMin * 60;
+  const pts = rows.filter(r => r[0] >= start);
+  const vals = pts.map(r => r[1]).filter(v => v !== null);
+  const lo = Math.min(...vals, LOW) - 5, hi = Math.max(...vals, NOMINAL) + 5;
+  const padL = 36, padB = 18;
+  const x = t => padL + (t - start) / (end - start) * (w - padL - 4);
+  const y = v => (h - padB) - (v - lo) / (hi - lo) * (h - padB - 6);
+
+  ctx.font = "11px system-ui"; ctx.fillStyle = css("--hint"); ctx.strokeStyle = css("--hint");
+  // Horizontal guides: alert limit and nominal voltage.
+  for (const [v, label] of [[LOW, `${LOW}`], [NOMINAL, `${NOMINAL}`], [HIGH, `${HIGH}`]]) {
+    if (v < lo || v > hi) continue;
+    ctx.globalAlpha = 0.35; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(padL, y(v)); ctx.lineTo(w, y(v)); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    ctx.fillText(label, 2, y(v) + 4);
+  }
+  // Time labels.
+  for (let i = 0; i <= 3; i++) {
+    const t = start + (end - start) * i / 3;
+    const s = new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    ctx.fillText(s, Math.min(x(t) - 14, w - 34), h - 4);
+  }
+  // Outages shaded, voltage as a line with gaps.
+  ctx.fillStyle = css("--low"); ctx.globalAlpha = 0.12;
+  for (let i = 0; i < pts.length; i++) {
+    if (pts[i][1] === null) {
+      const next = i + 1 < pts.length ? pts[i + 1][0] : end;
+      ctx.fillRect(x(pts[i][0]), 0, Math.max(1, x(next) - x(pts[i][0])), h - padB);
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = css("--accent"); ctx.lineWidth = 2; ctx.beginPath();
+  let pen = false;
+  for (const [t, v] of pts) {
+    if (v === null) { pen = false; continue; }
+    pen ? ctx.lineTo(x(t), y(v)) : ctx.moveTo(x(t), y(v));
+    pen = true;
+  }
+  ctx.stroke();
+
+  document.getElementById("min").textContent = vals.length ? `min ${Math.min(...vals).toFixed(1)} V` : "";
+  document.getElementById("max").textContent = vals.length ? `max ${Math.max(...vals).toFixed(1)} V` : "";
+}
+
+window.addEventListener("resize", draw);
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
