@@ -1,7 +1,7 @@
 """Telegram bot that shows the EcoFlow AC input voltage, live.
 
 Commands:
-    /voltage  - send a message and keep updating it every second
+    /voltage  - send a message and keep updating it every few seconds
     /stop     - stop updating
     /plot [minutes] - add a live chart, refreshed every 30 s (default: last 60 minutes, max 180)
     /start    - help
@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 from telegram import BotCommand, InputMediaPhoto, Update
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import history
@@ -48,9 +48,13 @@ load_dotenv()
 sn = os.environ["ECOFLOW_SN"]
 allowed_ids = {int(x) for x in os.environ.get("TELEGRAM_ALLOWED_IDS", "").split(",") if x.strip()}
 
-UPDATE_EVERY = 1.0  # seconds between message edits
+UPDATE_EVERY = 1.0  # seconds between device snapshot requests
+# Seconds between live text edits. Telegram rate-limits sustained edits: at one
+# per second it froze the bot for ~9 minutes after about 40 minutes.
+TEXT_EVERY = float(os.environ.get("LIVE_UPDATE_EVERY", 3))
 STALE_AFTER = 15    # seconds without device data before saying so
 CHART_EVERY = 30.0  # seconds between live chart refreshes
+MAX_BACKOFF = 60.0  # slowest edit interval after repeated rate limits
 
 # Alerts go to every chat in TELEGRAM_ALLOWED_IDS.
 alarm = VoltageAlarm(
@@ -101,20 +105,46 @@ def status_text() -> str:
 
 
 async def keep_editing(chat_id: int, message_id: int, every: float, edit) -> None:
-    """Call `edit()` every `every` seconds until the message is gone."""
+    """Call `edit()` every `every` seconds until the message is gone.
+
+    When Telegram rate-limits us, wait as told and halve the edit rate; speed
+    back up gradually once edits go through again.
+    """
+    interval = every
+    ok_streak = 0
     while True:
-        await asyncio.sleep(every)
+        await asyncio.sleep(interval)
         try:
             await edit()
+            ok_streak += 1
+            if interval > every and ok_streak >= 50:
+                interval = max(every, interval / 2)
+                ok_streak = 0
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+            ok_streak = 0
+            interval = min(interval * 2, MAX_BACKOFF)
+            log.warning("Telegram rate limit in %s: waiting %s s, then editing every %.0f s",
+                        chat_id, e.retry_after, interval)
+            await asyncio.sleep(float(e.retry_after))
         except BadRequest as e:
             if "not modified" in str(e).lower():
                 continue
             log.warning("Stopped live updates in %s: %s", chat_id, e)  # e.g. message deleted
             return
-        except Exception:
-            log.exception("Live update failed in %s, retrying", chat_id)  # e.g. network blip
+        except Exception as e:
+            log.warning("Live update failed in %s (%s), retrying", chat_id, e)  # e.g. network blip
+
+
+async def with_retry(send, attempts: int = 3):
+    """Run `send()`, waiting out Telegram rate limits, so alerts aren't lost."""
+    for attempt in range(attempts):
+        try:
+            return await send()
+        except RetryAfter as e:
+            if attempt == attempts - 1:
+                raise
+            log.warning("Telegram rate limit: waiting %s s before sending", e.retry_after)
+            await asyncio.sleep(float(e.retry_after))
 
 
 def resume_live(bot, chat_id: int, state: dict) -> None:
@@ -134,7 +164,7 @@ def resume_live(bot, chat_id: int, state: dict) -> None:
             if text != last_text[0]:
                 await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
                 last_text[0] = text
-        tasks.append(asyncio.create_task(keep_editing(chat_id, state["text"], UPDATE_EVERY, edit_text)))
+        tasks.append(asyncio.create_task(keep_editing(chat_id, state["text"], TEXT_EVERY, edit_text)))
     live_tasks[chat_id] = tasks
 
 
@@ -167,8 +197,8 @@ async def post_live(bot, chat_id: int, chart_minutes: int | None = None) -> None
     if chart_minutes:
         png = await asyncio.to_thread(history.plot_png, chart_minutes)
         if png:
-            state["chart"] = (await bot.send_photo(chat_id, png)).message_id
-    state["text"] = (await bot.send_message(chat_id, status_text())).message_id
+            state["chart"] = (await with_retry(lambda: bot.send_photo(chat_id, png))).message_id
+    state["text"] = (await with_retry(lambda: bot.send_message(chat_id, status_text()))).message_id
     resume_live(bot, chat_id, state)
     save_live()
 
@@ -181,7 +211,7 @@ async def keep_live_last(bot, chat_id: int) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Send /voltage to see the AC input voltage, updated every second. /stop stops it.\n"
+        f"Send /voltage to see the AC input voltage, updated every {TEXT_EVERY:.0f} s. /stop stops it.\n"
         f"/plot adds a live chart of the last hour, refreshed every {CHART_EVERY:.0f} s; "
         f"/plot 15 shows the last 15 minutes (up to {history.KEEP_MINUTES}).\n"
         f"You'll get a warning if the voltage stays below {alarm.low:.0f} V or above {alarm.high:.0f} V.\n"
@@ -246,7 +276,7 @@ async def watch_voltage(app: Application) -> None:
         log.info("Alert: %s", text)
         for chat_id in allowed_ids:
             try:
-                await app.bot.send_message(chat_id, text)
+                await with_retry(lambda: app.bot.send_message(chat_id, text))
                 await keep_live_last(app.bot, chat_id)
             except Exception:
                 log.exception("Could not send alert to %s", chat_id)
@@ -255,7 +285,7 @@ async def watch_voltage(app: Application) -> None:
 async def on_startup(app: Application) -> None:
     # Shown in Telegram's Menu button and when typing "/".
     await app.bot.set_my_commands([
-        BotCommand("voltage", "Live voltage, updated every second"),
+        BotCommand("voltage", "Live voltage, updated every few seconds"),
         BotCommand("plot", "Live chart, last 60 min (e.g. /plot 15)"),
         BotCommand("stop", "Stop live updates"),
         BotCommand("start", "Help and your chat ID"),
@@ -277,6 +307,15 @@ async def on_startup(app: Application) -> None:
         log.info("Resumed live updates in %d chat(s)", len(live))
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log command failures in one line; rate limits and timeouts aren't bugs."""
+    err = context.error
+    if isinstance(err, (RetryAfter, TimedOut, NetworkError)):
+        log.warning("Command failed: %s", err)
+    else:
+        log.error("Command failed", exc_info=err)
+
+
 async def on_shutdown(app: Application) -> None:
     reader.stop()
 
@@ -293,6 +332,7 @@ def main() -> None:
     app.add_handler(CommandHandler("voltage", voltage))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("plot", plot))
+    app.add_error_handler(on_error)
     app.run_polling()
 
 
