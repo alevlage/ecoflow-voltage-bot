@@ -19,7 +19,7 @@ an alert, it re-posts them below it. Every reading is logged to
 voltage_log.csv; charts use the last 3 hours kept in memory.
 
 Sends a warning to TELEGRAM_ALLOWED_IDS when the voltage stays out of range
-(VOLTAGE_LOW / VOLTAGE_HIGH in .env, default 190 / 250 V) for
+(VOLTAGE_LOW / VOLTAGE_HIGH in .env, default 180 / 250 V) for
 VOLTAGE_ALERT_AFTER seconds (default 10), and again when it's back to normal.
 
 Reads data via the app-login route (ecoflow_mqtt.py), so it needs
@@ -72,7 +72,7 @@ COMMAND_MAX_WAIT = 30.0  # a command gives up rather than wait longer for a rate
 
 # Alerts go to every chat in TELEGRAM_ALLOWED_IDS.
 alarm = VoltageAlarm(
-    low=float(os.environ.get("VOLTAGE_LOW", 190)),
+    low=float(os.environ.get("VOLTAGE_LOW", 180)),
     high=float(os.environ.get("VOLTAGE_HIGH", 250)),
     hold=float(os.environ.get("VOLTAGE_ALERT_AFTER", 10)),
 )
@@ -190,7 +190,7 @@ def resume_live(bot, chat_id: int, state: dict) -> None:
     tasks = []
     if state.get("chart"):
         async def edit_chart(message_id=state["chart"], minutes=state.get("minutes", 60)):
-            png = await asyncio.to_thread(history.plot_png, minutes)
+            png = await asyncio.to_thread(history.plot_png, minutes, (alarm.low, alarm.high))
             if png:
                 await bot.edit_message_media(InputMediaPhoto(png), chat_id=chat_id, message_id=message_id)
         tasks.append(asyncio.create_task(
@@ -254,7 +254,7 @@ async def post_live(bot, chat_id: int, chart_minutes: int | None = None,
         state = {"text": None, "chart": None, "minutes": chart_minutes,
                  "until": until or time.time() + LIVE_MINUTES * 60}
         if chart_minutes:
-            png = await asyncio.to_thread(history.plot_png, chart_minutes)
+            png = await asyncio.to_thread(history.plot_png, chart_minutes, (alarm.low, alarm.high))
             if png:
                 state["chart"] = (await with_retry(lambda: bot.send_photo(chat_id, png),
                                                    max_wait=max_wait)).message_id
@@ -326,7 +326,7 @@ async def plot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /plot [minutes], e.g. /plot 30")
         return
     minutes = min(minutes, history.KEEP_MINUTES)
-    if await asyncio.to_thread(history.plot_png, minutes) is None:
+    if await asyncio.to_thread(history.plot_png, minutes, (alarm.low, alarm.high)) is None:
         await update.message.reply_text("No readings recorded yet — try again in a minute")
         return
     await post_live(context.bot, update.effective_chat.id, chart_minutes=minutes,

@@ -78,10 +78,31 @@ def recent(since: float) -> list[tuple[float, float | None]]:
         return [row for row in _recent if row[0] > since]
 
 
-def plot_png(minutes: int) -> bytes | None:
-    """Render the last `minutes` (up to 180) of history. Returns PNG bytes, or None if empty."""
+MARK_OUTAGES_FROM = 60  # seconds; shorter outages are shaded but get no time label
+
+
+def outages(rows: list[tuple[float, float | None]]) -> list[tuple[float, float | None]]:
+    """Stretches with no electricity as (start, end); end is None if it's still out."""
+    spans, start = [], None
+    for ts, volts in rows:
+        if volts is None and start is None:
+            start = ts
+        elif volts is not None and start is not None:
+            spans.append((start, ts))
+            start = None
+    if start is not None:
+        spans.append((start, None))
+    return spans
+
+
+def plot_png(minutes: int, limits: tuple[float, float] | None = None) -> bytes | None:
+    """Render the last `minutes` (up to 180) of history. Returns PNG bytes, or None if empty.
+
+    `limits` are the (low, high) alert limits, drawn as light red lines.
+    """
     minutes = min(minutes, KEEP_MINUTES)
-    since = time.time() - minutes * 60
+    now_ts = time.time()
+    since = now_ts - minutes * 60
     with _lock:
         rows = [row for row in _recent if row[0] >= since]
     if not rows:
@@ -92,17 +113,30 @@ def plot_png(minutes: int) -> bytes | None:
     fig, ax = plt.subplots(figsize=(9, 4.5), dpi=120)
     ax.plot(times, volts, color="#1f77b4", linewidth=1.4)
     ax.axhline(NOMINAL_VOLTS, color="#888", linestyle="--", linewidth=0.8, label=f"{NOMINAL_VOLTS} V")
-    # Shade stretches with no electricity.
-    outage_start = None
-    outage_label = "No electricity"
-    for t, v in zip(times + [None], volts + [0.0]):
-        off = v != v  # NaN
-        if off and outage_start is None:
-            outage_start = t
-        elif not off and outage_start is not None:
-            ax.axvspan(outage_start, t or times[-1], color="#d62728", alpha=0.15, label=outage_label)
-            outage_label = None  # one legend entry for all outages
-            outage_start = None
+    if limits:
+        for i, v in enumerate(limits):
+            ax.axhline(v, color="#e57373", linestyle="--", linewidth=1, alpha=0.8,
+                       label=f"Limits {limits[0]:.0f} / {limits[1]:.0f} V" if i == 0 else None)
+    ax.set_xlim(times[0], datetime.fromtimestamp(now_ts))
+
+    # Shade stretches with no electricity and mark when it went off and came back.
+    window = max(now_ts - rows[0][0], 1)
+    mark = dict(rotation=90, fontsize=8, va="top", color="#b71c1c",
+                transform=ax.get_xaxis_transform())  # x in data, y in axes fraction
+    for i, (start, end) in enumerate(outages(rows)):
+        t0 = datetime.fromtimestamp(start)
+        t1 = datetime.fromtimestamp(end or now_ts)
+        ax.axvspan(t0, t1, color="#d62728", alpha=0.15, label="No electricity" if i == 0 else None)
+        if (end or now_ts) - start < MARK_OUTAGES_FROM:
+            continue
+        cut_off = start == rows[0][0]  # began before the chart starts: start unknown
+        if end and not cut_off and (end - start) / window < 0.03:  # too narrow for two labels
+            ax.text(t0, 0.98, f" off {t0:%H:%M}–{t1:%H:%M}", ha="right", **mark)
+            continue
+        if not cut_off:
+            ax.text(t0, 0.98, f" off {t0:%H:%M}", ha="right", **mark)
+        if end:
+            ax.text(t1, 0.98, f" on {t1:%H:%M}", ha="left", **mark)
     known = [v for v in volts if v == v]
     now = f"now {volts[-1]:.1f} V" if volts[-1] == volts[-1] else "now no electricity"
     if known:
@@ -113,7 +147,7 @@ def plot_png(minutes: int) -> bytes | None:
     ax.set_ylabel("Volts")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.grid(alpha=0.3)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, frameon=False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
     fig.autofmt_xdate()
     fig.tight_layout()
 

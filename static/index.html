@@ -61,12 +61,15 @@
   </div>
 
 <script>
+// Wrapped in a function: Telegram for macOS injects its own global `css`
+// variable into the page, which overwrote ours.
+(() => {
 const tg = window.Telegram && window.Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); document.documentElement.dataset.tg = "1"; }
 const initData = tg ? tg.initData : "";
 
 // Alert limits come from the server (VOLTAGE_LOW / VOLTAGE_HIGH).
-let LOW = 190, HIGH = 250;
+let LOW = 180, HIGH = 250;
 const NOMINAL = 230;
 
 let rows = [];          // [timestamp, volts or null], oldest first
@@ -80,7 +83,7 @@ document.querySelectorAll(".ranges button").forEach(b => b.onclick = () => {
   draw();
 });
 
-function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
 async function poll() {
   try {
@@ -135,36 +138,57 @@ function draw() {
   const end = Date.now() / 1000, start = end - rangeMin * 60;
   const pts = rows.filter(r => r[0] >= start);
   const vals = pts.map(r => r[1]).filter(v => v !== null);
-  const lo = Math.min(...vals, LOW) - 5, hi = Math.max(...vals, NOMINAL) + 5;
+  const lo = Math.min(...vals, LOW) - 5, hi = Math.max(...vals, HIGH) + 5;
   const padL = 36, padB = 18;
   const x = t => padL + (t - start) / (end - start) * (w - padL - 4);
   const y = v => (h - padB) - (v - lo) / (hi - lo) * (h - padB - 6);
+  const hm = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-  ctx.font = "11px system-ui"; ctx.fillStyle = css("--hint"); ctx.strokeStyle = css("--hint");
-  // Horizontal guides: alert limit and nominal voltage.
-  for (const [v, label] of [[LOW, `${LOW}`], [NOMINAL, `${NOMINAL}`], [HIGH, `${HIGH}`]]) {
-    if (v < lo || v > hi) continue;
-    ctx.globalAlpha = 0.35; ctx.setLineDash([4, 4]);
+  ctx.font = "11px system-ui";
+  // Horizontal guides: alert limits in light red, nominal voltage in grey.
+  for (const [v, color] of [[LOW, cssVar("--low")], [NOMINAL, cssVar("--hint")], [HIGH, cssVar("--low")]]) {
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    ctx.globalAlpha = color === cssVar("--hint") ? 0.35 : 0.55; ctx.setLineDash([4, 4]);
     ctx.beginPath(); ctx.moveTo(padL, y(v)); ctx.lineTo(w, y(v)); ctx.stroke();
     ctx.setLineDash([]); ctx.globalAlpha = 1;
-    ctx.fillText(label, 2, y(v) + 4);
+    ctx.fillText(`${v}`, 2, y(v) + 4);
   }
   // Time labels.
+  ctx.fillStyle = cssVar("--hint");
   for (let i = 0; i <= 3; i++) {
     const t = start + (end - start) * i / 3;
-    const s = new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    ctx.fillText(s, Math.min(x(t) - 14, w - 34), h - 4);
+    ctx.fillText(hm(t), Math.min(x(t) - 14, w - 34), h - 4);
   }
-  // Outages shaded, voltage as a line with gaps.
-  ctx.fillStyle = css("--low"); ctx.globalAlpha = 0.12;
+  // Outages: shaded, with the time the electricity went off and came back.
+  const spans = [];
   for (let i = 0; i < pts.length; i++) {
-    if (pts[i][1] === null) {
-      const next = i + 1 < pts.length ? pts[i + 1][0] : end;
-      ctx.fillRect(x(pts[i][0]), 0, Math.max(1, x(next) - x(pts[i][0])), h - padB);
+    if (pts[i][1] !== null) continue;
+    const from = pts[i][0];
+    while (i < pts.length && pts[i][1] === null) i++;
+    spans.push([from, i < pts.length ? pts[i][0] : null]);  // null end: still out
+  }
+  const labels = [];                   // drawn last, on top of the voltage line
+  const mark = (t, label, side) => labels.push(() => {  // vertical text hanging from the top edge
+    ctx.save(); ctx.translate(x(t), 3); ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = "right"; ctx.textBaseline = side === "left" ? "bottom" : "top";
+    ctx.fillText(label, 0, side === "left" ? -2 : 2);
+    ctx.restore();
+  });
+  for (const [from, to] of spans) {
+    const x0 = x(from), x1 = x(to ?? end);
+    ctx.fillStyle = cssVar("--low"); ctx.globalAlpha = 0.12;
+    ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h - padB);
+    const cutOff = from === pts[0][0];    // began before the visible window: start unknown
+    if ((to ?? end) - from >= 60) {        // short blips get no labels
+      if (to && x1 - x0 < 26 && !cutOff) mark(from, `off ${hm(from)}–${hm(to)}`, "left");
+      else {
+        if (!cutOff) mark(from, `off ${hm(from)}`, "left");
+        if (to) mark(to, `on ${hm(to)}`, "right");
+      }
     }
   }
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = css("--accent"); ctx.lineWidth = 2; ctx.beginPath();
+  ctx.strokeStyle = cssVar("--accent"); ctx.lineWidth = 2; ctx.beginPath();
   let pen = false;
   for (const [t, v] of pts) {
     if (v === null) { pen = false; continue; }
@@ -172,6 +196,9 @@ function draw() {
     pen = true;
   }
   ctx.stroke();
+  ctx.fillStyle = cssVar("--low"); ctx.globalAlpha = 0.9; ctx.font = "10px system-ui";
+  labels.forEach(draw => draw());
+  ctx.globalAlpha = 1;
 
   document.getElementById("min").textContent = vals.length ? `min ${Math.min(...vals).toFixed(1)} V` : "";
   document.getElementById("max").textContent = vals.length ? `max ${Math.max(...vals).toFixed(1)} V` : "";
@@ -180,6 +207,7 @@ function draw() {
 window.addEventListener("resize", draw);
 poll();
 setInterval(poll, 1000);
+})();
 </script>
 </body>
 </html>
