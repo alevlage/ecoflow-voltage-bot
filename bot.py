@@ -68,6 +68,7 @@ TEXT_EVERY = float(os.environ.get("LIVE_UPDATE_EVERY", 10))  # seconds between c
 CHART_EVERY = 120.0  # seconds between chat chart refreshes
 LIVE_MINUTES = float(os.environ.get("LIVE_MINUTES", 15))  # length of a chat live session
 STALE_AFTER = 15    # seconds without device data before saying so
+LATE_AFTER = 120.0  # seconds; a message sent later than this says it's late
 POWER_BACK_AFTER = 60.0  # seconds; shorter outages get no "electricity is back" message
 MAX_BACKOFF = 300.0  # slowest edit interval after repeated rate limits
 COMMAND_MAX_WAIT = 30.0  # a command gives up rather than wait longer for a rate limit
@@ -348,15 +349,38 @@ async def record_history() -> None:
                 await asyncio.to_thread(history.append, reader.volts, on, reader.watts, last)
 
 
-async def notify_all(app: Application, text: str) -> None:
-    """Send `text` to every allowed chat, waiting out rate limits, then re-post live messages."""
+# Alerts wait here for send_notifications(), so a long Telegram rate limit
+# delays the messages but never the voltage checks. Created in on_startup.
+outbox: asyncio.Queue | None = None
+
+
+def notify_all(text: str, at: float | None = None) -> None:
+    """Queue `text` for every allowed chat. `at` is when it happened (default: now)."""
     log.info("Notify: %s", text.replace("\n", " | "))
-    for chat_id in allowed_ids:
-        try:
-            await with_retry(lambda: app.bot.send_message(chat_id, text, reply_markup=page_button()))
-            await keep_live_last(app.bot, chat_id)
-        except Exception:
-            log.exception("Could not send a message to %s", chat_id)
+    outbox.put_nowait((text, at or time.time()))
+
+
+def with_time(text: str, at: float) -> str:
+    """Add when it happened, and say so if the message is going out late."""
+    when = datetime.fromtimestamp(at)
+    text += f"\n🕒 {when:%H:%M}" if when.date() == datetime.now().date() else f"\n🕒 {when:%d.%m %H:%M}"
+    late = time.time() - at
+    if late > LATE_AFTER:
+        text += f"\n⏳ Sent {took(late)} late: Telegram was holding the bot's messages"
+    return text
+
+
+async def send_notifications(app: Application) -> None:
+    while True:
+        text, at = await outbox.get()
+        for chat_id in allowed_ids:
+            try:
+                # Built on each attempt, so a late note shows the real delay.
+                await with_retry(lambda: app.bot.send_message(
+                    chat_id, with_time(text, at), reply_markup=page_button()))
+                await keep_live_last(app.bot, chat_id)
+            except Exception:
+                log.exception("Could not send a message to %s", chat_id)
 
 
 def took(seconds: float) -> str:
@@ -382,9 +406,9 @@ async def watch_power(app: Application) -> None:
             off_for, started = now - off_since, off_since
             off_since = None
             if off_for >= POWER_BACK_AFTER:
-                await notify_all(app, f"💡 Electricity is back: {reader.volts:.1f} V\n"
-                                      f"⚫ It was off for {took(off_for)}, "
-                                      f"since {datetime.fromtimestamp(started):%H:%M}")
+                notify_all(f"💡 Electricity is back: {reader.volts:.1f} V\n"
+                           f"⚫ It was off for {took(off_for)}, "
+                           f"since {datetime.fromtimestamp(started):%H:%M}")
 
 
 async def watch_voltage(app: Application) -> None:
@@ -400,10 +424,11 @@ async def watch_voltage(app: Application) -> None:
         level = alarm.update(reader.volts, last)
         if level is None:
             continue
-        await notify_all(app, alarm.message(level, reader.volts))
+        notify_all(alarm.message(level, reader.volts), last)
 
 
 async def on_startup(app: Application) -> None:
+    global outbox
     # Shown in Telegram's Menu button and when typing "/".
     commands = [
         BotCommand("voltage", f"Voltage, updated for {LIVE_MINUTES:.0f} min"),
@@ -423,6 +448,8 @@ async def on_startup(app: Application) -> None:
     # app.create_task warns before the app is running, so use asyncio directly.
     asyncio.create_task(record_history())
     if allowed_ids:
+        outbox = asyncio.Queue()
+        asyncio.create_task(send_notifications(app))
         asyncio.create_task(watch_voltage(app))
         asyncio.create_task(watch_power(app))
     else:
