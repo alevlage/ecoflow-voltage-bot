@@ -55,6 +55,7 @@ TEXT_EVERY = float(os.environ.get("LIVE_UPDATE_EVERY", 3))
 STALE_AFTER = 15    # seconds without device data before saying so
 CHART_EVERY = 30.0  # seconds between live chart refreshes
 MAX_BACKOFF = 60.0  # slowest edit interval after repeated rate limits
+COMMAND_MAX_WAIT = 30.0  # a command gives up rather than wait longer for a rate limit
 
 # Alerts go to every chat in TELEGRAM_ALLOWED_IDS.
 alarm = VoltageAlarm(
@@ -135,16 +136,21 @@ async def keep_editing(chat_id: int, message_id: int, every: float, edit) -> Non
             log.warning("Live update failed in %s (%s), retrying", chat_id, e)  # e.g. network blip
 
 
-async def with_retry(send, attempts: int = 3):
-    """Run `send()`, waiting out Telegram rate limits, so alerts aren't lost."""
+async def with_retry(send, attempts: int = 3, max_wait: float | None = None):
+    """Run `send()`, waiting out Telegram rate limits, so alerts aren't lost.
+
+    max_wait: give up (re-raise) instead of waiting longer than this, so a
+    command doesn't hang for minutes during a long rate limit.
+    """
     for attempt in range(attempts):
         try:
             return await send()
         except RetryAfter as e:
-            if attempt == attempts - 1:
+            wait = float(e.retry_after)
+            if attempt == attempts - 1 or (max_wait is not None and wait > max_wait):
                 raise
-            log.warning("Telegram rate limit: waiting %s s before sending", e.retry_after)
-            await asyncio.sleep(float(e.retry_after))
+            log.warning("Telegram rate limit: waiting %.0f s before sending", wait)
+            await asyncio.sleep(wait)
 
 
 def resume_live(bot, chat_id: int, state: dict) -> None:
@@ -184,23 +190,42 @@ async def stop_live(bot, chat_id: int, delete: bool = False) -> dict | None:
     return state
 
 
-async def post_live(bot, chat_id: int, chart_minutes: int | None = None) -> None:
+post_locks: dict[int, asyncio.Lock] = {}  # commands run concurrently; one re-post per chat at a time
+
+
+async def post_live(bot, chat_id: int, chart_minutes: int | None = None,
+                    max_wait: float | None = None) -> None:
     """(Re)post the live chart and text at the bottom of the chat.
 
     chart_minutes: show a chart of that many minutes; None keeps whatever
     chart the chat already had (or none).
+
+    The new messages are sent first and the old ones deleted only after
+    that worked, so a failure (e.g. a rate limit) leaves the old ones live.
     """
-    old = await stop_live(bot, chat_id, delete=True) or {}
-    if chart_minutes is None and old.get("chart"):
-        chart_minutes = old.get("minutes", 60)
-    state = {"text": None, "chart": None, "minutes": chart_minutes}
-    if chart_minutes:
-        png = await asyncio.to_thread(history.plot_png, chart_minutes)
-        if png:
-            state["chart"] = (await with_retry(lambda: bot.send_photo(chat_id, png))).message_id
-    state["text"] = (await with_retry(lambda: bot.send_message(chat_id, status_text()))).message_id
-    resume_live(bot, chat_id, state)
-    save_live()
+    async with post_locks.setdefault(chat_id, asyncio.Lock()):
+        old = live.get(chat_id) or {}
+        if chart_minutes is None and old.get("chart"):
+            chart_minutes = old.get("minutes", 60)
+        state = {"text": None, "chart": None, "minutes": chart_minutes}
+        if chart_minutes:
+            png = await asyncio.to_thread(history.plot_png, chart_minutes)
+            if png:
+                state["chart"] = (await with_retry(lambda: bot.send_photo(chat_id, png),
+                                                   max_wait=max_wait)).message_id
+        try:
+            state["text"] = (await with_retry(lambda: bot.send_message(chat_id, status_text()),
+                                              max_wait=max_wait)).message_id
+        except Exception:
+            if state["chart"]:  # don't leave a half-posted pair behind
+                try:
+                    await bot.delete_message(chat_id, state["chart"])
+                except Exception:
+                    pass
+            raise
+        await stop_live(bot, chat_id, delete=True)
+        resume_live(bot, chat_id, state)
+        save_live()
 
 
 async def keep_live_last(bot, chat_id: int) -> None:
@@ -222,7 +247,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def voltage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    await post_live(context.bot, update.effective_chat.id)
+    await post_live(context.bot, update.effective_chat.id, max_wait=COMMAND_MAX_WAIT)
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -244,7 +269,8 @@ async def plot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await asyncio.to_thread(history.plot_png, minutes) is None:
         await update.message.reply_text("No readings recorded yet — try again in a minute")
         return
-    await post_live(context.bot, update.effective_chat.id, chart_minutes=minutes)
+    await post_live(context.bot, update.effective_chat.id, chart_minutes=minutes,
+                    max_wait=COMMAND_MAX_WAIT)
 
 
 async def record_history() -> None:
@@ -323,6 +349,7 @@ async def on_shutdown(app: Application) -> None:
 def main() -> None:
     app = (
         Application.builder()
+        .concurrent_updates(True)  # a slow command must not block the others
         .token(os.environ["TELEGRAM_BOT_TOKEN"])
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
