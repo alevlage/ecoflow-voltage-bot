@@ -255,6 +255,8 @@ class LiveReader:
     # A live grid voltage changes every few seconds; a frozen one means the
     # device is showing a leftover value from a dead socket.
     FROZEN_AFTER = 30.0
+    # Sometimes the device reports ~0 V instead of freezing the last voltage.
+    NO_POWER_BELOW = 50.0
     # With no data for this long, log in again and reconnect: the connection
     # or its login may have expired. Also the retry interval while it fails.
     RECONNECT_AFTER = 120.0
@@ -299,6 +301,8 @@ class LiveReader:
 
     def electricity_on(self) -> bool | None:
         """True/False, or None while it's too early to tell."""
+        if self.volts is not None and self.volts < self.NO_POWER_BELOW:
+            return False
         if self.watts:
             return True
         if time.time() - self.volts_changed_at < self.FROZEN_AFTER:

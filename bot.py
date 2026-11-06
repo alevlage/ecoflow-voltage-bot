@@ -21,7 +21,7 @@ voltage_log.csv; charts use the last 3 hours kept in memory.
 Sends a warning to TELEGRAM_ALLOWED_IDS when the voltage stays out of range
 (VOLTAGE_LOW / VOLTAGE_HIGH in .env, default 180 / 250 V) for
 VOLTAGE_ALERT_AFTER seconds (default 10), and again when it's back to normal.
-Also says when the electricity comes back after an outage of a minute or more.
+Also says when the electricity goes off and comes back (outages of a minute or more).
 
 Reads data via the app-login route (ecoflow_mqtt.py), so it needs
 ECOFLOW_EMAIL, ECOFLOW_PASSWORD and ECOFLOW_SN in .env, plus:
@@ -69,7 +69,7 @@ CHART_EVERY = 120.0  # seconds between chat chart refreshes
 LIVE_MINUTES = float(os.environ.get("LIVE_MINUTES", 15))  # length of a chat live session
 STALE_AFTER = 15    # seconds without device data before saying so
 LATE_AFTER = 120.0  # seconds; a message sent later than this says it's late
-POWER_BACK_AFTER = 60.0  # seconds; shorter outages get no "electricity is back" message
+POWER_MESSAGE_AFTER = 60.0  # seconds; shorter outages get no "gone"/"back" messages
 MAX_BACKOFF = 300.0  # slowest edit interval after repeated rate limits
 COMMAND_MAX_WAIT = 30.0  # a command gives up rather than wait longer for a rate limit
 
@@ -293,7 +293,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"(up to {history.KEEP_MINUTES}).\n"
         f"{page}"
         f"You'll get a warning if the voltage stays below {alarm.low:.0f} V or above {alarm.high:.0f} V, "
-        f"and a message when the electricity comes back.\n"
+        f"and a message when the electricity goes off and comes back.\n"
         f"Your chat ID: {update.effective_chat.id}",
         reply_markup=page_button(),
     )
@@ -391,21 +391,31 @@ def took(seconds: float) -> str:
 
 
 async def watch_power(app: Application) -> None:
-    """Message every allowed chat when the electricity comes back after an outage."""
+    """Message every allowed chat when the electricity goes off and when it comes back.
+
+    Outages shorter than POWER_MESSAGE_AFTER get neither message, so a
+    flicker doesn't send a pair.
+    """
     off_since = history.current_outage_start()  # outage already going on at startup
+    announced = off_since is not None  # assume it was announced before the restart
     while True:
         await asyncio.sleep(UPDATE_EVERY)
         now = time.time()
         if not reader.updated_at or now - reader.updated_at > STALE_AFTER:
             continue  # no fresh data from the device: can't tell
         on = reader.electricity_on()
-        if on is False and off_since is None:
-            # The voltage froze when the power went, so that's when it started.
-            off_since = reader.volts_changed_at or now
+        if on is False:
+            if off_since is None:
+                # The voltage froze (or dropped to 0) when the power went: that's the start.
+                off_since = min(reader.volts_changed_at or now, now)
+            if not announced and now - off_since >= POWER_MESSAGE_AFTER:
+                announced = True
+                notify_all("⚫ Electricity is gone", off_since)
         elif on and off_since is not None:
             off_for, started = now - off_since, off_since
             off_since = None
-            if off_for >= POWER_BACK_AFTER:
+            if announced:
+                announced = False
                 notify_all(f"💡 Electricity is back: {reader.volts:.1f} V\n"
                            f"⚫ It was off for {took(off_for)}, "
                            f"since {datetime.fromtimestamp(started):%H:%M}")
