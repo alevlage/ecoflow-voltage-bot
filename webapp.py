@@ -37,28 +37,59 @@ log = logging.getLogger(__name__)
 
 PAGE = Path(__file__).with_name("static") / "index.html"
 INIT_DATA_MAX_AGE = 24 * 3600  # seconds a signed Telegram login stays valid
+# Telegram on phones keeps a minimized Mini App open with its first login,
+# which then gets too old. So a valid login also gets a session token that
+# renews itself with every request and lapses after this long unused.
+SESSION_MAX_IDLE = 30 * 24 * 3600
 SHARE_KEEP = 24 * 3600  # seconds a shared chart picture stays downloadable at most
 SHARE_MAX = 30          # shared pictures kept in memory at once
 
 
-def telegram_user_id(init_data: str, bot_token: str) -> int | None:
-    """Return the user id from a valid Telegram Mini App initData, else None.
+def check_init_data(init_data: str, bot_token: str) -> tuple[int | None, str]:
+    """(user id, "") for a valid Telegram Mini App initData, else (None, reason).
 
     https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
     """
+    if not init_data:
+        return None, "no_login"
     fields = dict(parse_qsl(init_data, keep_blank_values=True))
     received_hash = fields.pop("hash", "")
     check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
     secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
     expected = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
     if not received_hash or not hmac.compare_digest(expected, received_hash):
-        return None
-    if time.time() - int(fields.get("auth_date", 0)) > INIT_DATA_MAX_AGE:
-        return None
+        return None, "bad_signature"
     try:
-        return int(json.loads(fields["user"])["id"])
+        if time.time() - int(fields.get("auth_date", 0)) > INIT_DATA_MAX_AGE:
+            return None, "expired"
+        return int(json.loads(fields["user"])["id"]), ""
     except (KeyError, ValueError, TypeError):
+        return None, "bad_login"
+
+
+def telegram_user_id(init_data: str, bot_token: str) -> int | None:
+    return check_init_data(init_data, bot_token)[0]
+
+
+def _session_sig(user_id: int, expires: int, bot_token: str) -> str:
+    key = hmac.new(b"VoltageSession", bot_token.encode(), hashlib.sha256).digest()
+    return hmac.new(key, f"{user_id}.{expires}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_session(user_id: int, bot_token: str) -> str:
+    expires = int(time.time() + SESSION_MAX_IDLE)
+    return f"{user_id}.{expires}.{_session_sig(user_id, expires, bot_token)}"
+
+
+def session_user_id(token: str, bot_token: str) -> int | None:
+    try:
+        user_id, expires, sig = token.split(".")
+        user_id, expires = int(user_id), int(expires)
+    except ValueError:
         return None
+    if expires < time.time() or not hmac.compare_digest(sig, _session_sig(user_id, expires, bot_token)):
+        return None
+    return user_id
 
 
 def share_caption(reader, minutes: int) -> str:
@@ -93,21 +124,40 @@ def make_app(reader, bot: Bot, allowed_ids: set[int], limits: tuple[float, float
              public_url: str = "") -> web.Application:
     shared: dict[str, tuple[bytes, float]] = {}  # token -> (JPEG, expires at)
 
+    rejected_logged: dict[str, float] = {}  # reason -> last logged, to keep the log short
+
     def user_of(request: web.Request) -> int | None:
-        user_id = telegram_user_id(request.headers.get("X-Telegram-Init-Data", ""), bot.token)
-        if user_id is None or (allowed_ids and user_id not in allowed_ids):
-            return None
+        """The allowed Telegram user making this request, or None (reason in request["why"])."""
+        user_id, why = check_init_data(request.headers.get("X-Telegram-Init-Data", ""), bot.token)
+        if user_id is None:
+            user_id = session_user_id(request.headers.get("X-Session", ""), bot.token)
+        if user_id is not None and allowed_ids and user_id not in allowed_ids:
+            user_id, why = None, "not_allowed"
+        if user_id is None:
+            request["why"] = why
+            if time.time() - rejected_logged.get(why, 0) > 600:
+                rejected_logged[why] = time.time()
+                log.warning("Live page request refused (%s) from %s", why,
+                            request.headers.get("User-Agent", "?")[:80])
         return user_id
 
-    def authorized(request: web.Request) -> bool:
-        return user_of(request) is not None
+    def refused(request: web.Request) -> web.Response:
+        messages = {
+            "expired": "Your Telegram login on this page is too old. Close the page completely "
+                       "and open it again from the bot.",
+            "not_allowed": "This Telegram account isn't allowed to see the voltage.",
+        }
+        why = request.get("why", "no_login")
+        return web.json_response({"error": messages.get(why, "Open this page from the Telegram bot"),
+                                  "why": why}, status=403)
 
     async def page(request: web.Request) -> web.Response:
         return web.FileResponse(PAGE, headers={"Cache-Control": "no-cache"})
 
     async def data(request: web.Request) -> web.Response:
-        if not authorized(request):
-            return web.json_response({"error": "Open this page from the Telegram bot"}, status=403)
+        user_id = user_of(request)
+        if user_id is None:
+            return refused(request)
         try:
             since = float(request.query.get("since", 0))
         except ValueError:
@@ -123,12 +173,13 @@ def make_app(reader, bot: Bot, allowed_ids: set[int], limits: tuple[float, float
             "keep_minutes": history.KEEP_MINUTES,
             "low": limits[0],
             "high": limits[1],
+            "session": make_session(user_id, bot.token),
         })
 
     async def share(request: web.Request) -> web.Response:
         user_id = user_of(request)
         if user_id is None:
-            return web.json_response({"error": "Open this page from the Telegram bot"}, status=403)
+            return refused(request)
         if not public_url:
             return web.json_response({"error": "Sharing needs WEBAPP_URL in .env"}, status=503)
         try:
