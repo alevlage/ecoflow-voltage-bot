@@ -21,7 +21,7 @@ voltage_log.csv; charts use the last 3 hours kept in memory.
 Sends a warning to TELEGRAM_ALLOWED_IDS when the voltage stays out of range
 (VOLTAGE_LOW / VOLTAGE_HIGH in .env, default 180 / 250 V) for
 VOLTAGE_ALERT_AFTER seconds (default 10), and again when it's back to normal.
-Also says when the electricity goes off and comes back (outages of a minute or more).
+Also says when the electricity goes off and when it comes back.
 
 Reads data via the app-login route (ecoflow_mqtt.py), so it needs
 ECOFLOW_EMAIL, ECOFLOW_PASSWORD and ECOFLOW_SN in .env, plus:
@@ -69,7 +69,6 @@ CHART_EVERY = 120.0  # seconds between chat chart refreshes
 LIVE_MINUTES = float(os.environ.get("LIVE_MINUTES", 15))  # length of a chat live session
 STALE_AFTER = 15    # seconds without device data before saying so
 LATE_AFTER = 120.0  # seconds; a message sent later than this says it's late
-POWER_MESSAGE_AFTER = 60.0  # seconds; shorter outages get no "gone"/"back" messages
 MAX_BACKOFF = 300.0  # slowest edit interval after repeated rate limits
 COMMAND_MAX_WAIT = 30.0  # a command gives up rather than wait longer for a rate limit
 
@@ -391,11 +390,7 @@ def took(seconds: float) -> str:
 
 
 async def watch_power(app: Application) -> None:
-    """Message every allowed chat when the electricity goes off and when it comes back.
-
-    Outages shorter than POWER_MESSAGE_AFTER get neither message, so a
-    flicker doesn't send a pair.
-    """
+    """Message every allowed chat as soon as the electricity goes off and when it comes back."""
     off_since = history.current_outage_start()  # outage already going on at startup
     announced = off_since is not None  # assume it was announced before the restart
     while True:
@@ -408,7 +403,10 @@ async def watch_power(app: Application) -> None:
             if off_since is None:
                 # The voltage froze (or dropped to 0) when the power went: that's the start.
                 off_since = min(reader.volts_changed_at or now, now)
-            if not announced and now - off_since >= POWER_MESSAGE_AFTER:
+                # To learn whether the device gives a faster sign of an outage.
+                log.info("Outage detected %.0f s after the voltage stopped changing; "
+                         "last voltage push %.0f s ago", now - off_since, now - reader.pushed_at)
+            if not announced:
                 announced = True
                 notify_all("⚫ Electricity is gone", off_since)
         elif on and off_since is not None:

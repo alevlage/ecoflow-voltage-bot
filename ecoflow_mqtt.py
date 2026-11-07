@@ -256,8 +256,9 @@ class LiveReader:
     """
 
     # A live grid voltage changes every few seconds; a frozen one means the
-    # device is showing a leftover value from a dead socket.
-    FROZEN_AFTER = 30.0
+    # device is showing a leftover value from a dead socket. With the power
+    # on, it stayed exactly the same for at most 15 s in the log.
+    FROZEN_AFTER = 20.0
     # Sometimes the device reports ~0 V instead of freezing the last voltage.
     NO_POWER_BELOW = 50.0
     # With no data for this long, log in again and reconnect: the connection
@@ -277,7 +278,7 @@ class LiveReader:
         self.started_at: float = 0.0
         self._stop = threading.Event()
         self._connected_at: float = 0.0
-        self._pushed_at: float = 0.0
+        self.pushed_at: float = 0.0  # last voltage pushed by the device itself
         self.ef: EcoFlowMqtt | None = None
 
     def _connect(self) -> None:
@@ -299,8 +300,8 @@ class LiveReader:
             volts, watts = reading
             now = time.time()
             if topic.startswith("/app/device/property/"):
-                self._pushed_at = now
-            elif now - self._pushed_at < self.PUSH_FRESH:
+                self.pushed_at = now
+            elif now - self.pushed_at < self.PUSH_FRESH:
                 self.updated_at = now  # still connected; the push has the newer values
                 return
             if self.volts is not None and volts != self.volts:
