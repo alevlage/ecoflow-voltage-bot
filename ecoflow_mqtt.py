@@ -248,8 +248,11 @@ def read_ac_input(sn: str, timeout: float = 30) -> tuple[float, float | None]:
 class LiveReader:
     """Keeps one connection open and holds the latest AC input reading.
 
-    The River 2 pushes its voltage only every ~3 s, so a snapshot is
-    requested every `interval` seconds to get fresher values.
+    The River 2 pushes a new voltage every ~3 s; that's as fresh as it gets.
+    A snapshot is also requested every `interval` seconds, but the cloud
+    answers with its copy of an earlier push, which can arrive after a newer
+    push. So snapshots only fill in while the device's own pushes are missing;
+    otherwise the voltage would flick back to the previous value.
     """
 
     # A live grid voltage changes every few seconds; a frozen one means the
@@ -260,6 +263,8 @@ class LiveReader:
     # With no data for this long, log in again and reconnect: the connection
     # or its login may have expired. Also the retry interval while it fails.
     RECONNECT_AFTER = 120.0
+    # Snapshots are ignored while the device pushed a voltage this recently.
+    PUSH_FRESH = 10.0
 
     def __init__(self, sn: str, interval: float = 1.0):
         load_dotenv()
@@ -272,6 +277,7 @@ class LiveReader:
         self.started_at: float = 0.0
         self._stop = threading.Event()
         self._connected_at: float = 0.0
+        self._pushed_at: float = 0.0
         self.ef: EcoFlowMqtt | None = None
 
     def _connect(self) -> None:
@@ -292,6 +298,11 @@ class LiveReader:
         if reading is not None:
             volts, watts = reading
             now = time.time()
+            if topic.startswith("/app/device/property/"):
+                self._pushed_at = now
+            elif now - self._pushed_at < self.PUSH_FRESH:
+                self.updated_at = now  # still connected; the push has the newer values
+                return
             if self.volts is not None and volts != self.volts:
                 self.volts_changed_at = now
             self.volts = volts
